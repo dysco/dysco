@@ -1,0 +1,432 @@
+DOCUMENTATION OF VERSION 3.0
+
+Table of Contents
+1. TCP Variables
+   1.1. Basic Variables
+   1.2. Deltas
+2. The Locking Protocol
+   2.1. Basic Operation
+   2.2. An Informal, Intuitive Proof
+   2.3. Other Protocol Cases
+3. The Anchoring State
+   3.1. Substates
+   3.2. Loss of UDP Messages
+4. The TwoPaths State
+   4.1. Data Handling
+   4.2. Checking Completion
+   4.3. Termination in Middleboxes
+5. Appendix
+   5.1. Independent Fins in Each Direction
+   5.2. A Discussion of Data
+
+1. TCP VARIABLES
+
+1.1. Basic Variables
+
+The basic variables used by a port to keep track of its state are farLoc
+(address), sending, receiving, finSent, and finRcvd (all Boolean).  If it
+is not clear to you what these variables mean, see 5.1: Independent Fins in
+Each Direction.
+
+The basic variables used by a port to keep track of the sequence numbers in
+a session are sent, sentAcked, rcvd, and rcvdAcked.
+
+Behavior is a variable used to customize the behavior of a port.
+
+The basic macros are SendSyn, ReceiveSyn, SendData, ReceiveData, SendFin,
+ReceiveFin, SendAck, ReceiveAck.  They are called in the obvious situations
+to update the state and sequence-number variables.
+
+1.2. Deltas
+
+Each port has a delta, initialized to 0.  It maintains the offset to 
+outgoing sequence numbers caused by events or logic particular to the 
+port.  An offset is a difference between what parties on the two sides of
+the port expect.
+
+So when a packet is sent out by a port,
+ * delta is added to its sequence number
+And when a packet is received in by a port,
+ * delta is subtracted from its acknowledgment number
+
+These adjustments are made outside the scope of the macros, so that macros
+do not see deltas.
+
+2. THE LOCKING PROTOCOL
+
+2.1. Basic operation
+
+A segment of a session is a contiguous chain of subsessions, separated by
+middleboxes.  A principal purpose of the locking protocol is to guarantee
+that there are no concurrent reconfigurations of overlapping segments of
+a session.  Fortunately, designing a protocol to guarantee this is
+straightforward because of the linear ordering of subsessions in a session.
+
+For the locking protocol, each Dysco agent at the left end of a subsession
+maintains two boolean variables lockPending and locked, both of which are
+initialized to false, and an address variable leftAnchor.  The scope of all
+these variables is the subsession of which this is the left endpoint.
+LeftAnchor has a meaningful value if and only if one of the boolean
+variables is true, in which case it is the address that is requesting or
+holding the lock. 
+
+To attempt locking of a segment, proposed left anchor executes:
+ * lockPending and locked must both be false
+ * lockPending = true, requestor = self
+ * send requestLock (leftAnchor = self, rightAnchor = desired) message to
+   subsession
+
+The requestLock message propagates to the right until it reaches an agent
+that replies to it.  As it propagates, each left end of a subsession 
+executes:
+ * lockPending = true, requestor = leftAnchor
+
+Eventually the requestLock message reaches an agent that absorbs and
+responds to it.  The possible cases are:
+ * It reaches the proposed right anchor, which replies with the control
+   message ackLock, with the same leftAnchor and rightAnchor fields as the
+   requestLock.  As the ackLock packet travels leftward along the segment 
+   until it reaches the left anchor, left endpoints of subsessions change 
+   their locked variables to true.
+ * It reaches the right endpoint of the supersession when it is not the
+   proposed right anchor of the segment, which means that the proposed 
+   right anchor cannot be found.  The right endpoint replies with the 
+   control message nackLock (same fields).  As the nackLock message travels
+   leftward along the path until it reaches the left anchor, left ends of 
+   subsessions change their lockPending variables to false.
+ * It reaches the left end of a subsession that is locked.  The left end
+   replies with the control message nackLock (same fields).  As the 
+   nackLock message travels leftward along the path until it reaches the 
+   left anchor, left ends of subsessions change their lockPending variables
+   to false.
+ * It reaches the left end of a subsession with locked = false, 
+   lockPending = true.  This agent is a prospective left anchor that is 
+   trying to lock its own segment.  It will not reply to the requestLock
+   until it gets a reply to its own requestLock.  Until then, it saves the
+   information from the requestLock it has received in a set of 
+   requestPending variables.
+      Upon receiving a reply to its own request, this agent nacks the new
+   request or reconstructs it from the requestPending variables and 
+   forwards it rightward, depending on whether the reply to its own request
+   was positive or negative, respectively.
+
+Locked subsessions are never unlocked.  Rather, they disappear as an effect
+of the reconfiguration.  It is important that the subsessions created in 
+the new segment are all initialized with locked = false, lockPending =
+false.
+
+2.2. An informal, intuitive proof
+
+The real proof that the locking protocol prevents reconfiguration 
+contention is by model checking.  However, the following informal proof
+may provide intuition.
+
+If there is contention, then two would-be left anchors will be requesting
+or holding the locks of overlapping segments.  Let A1 and A2 be the first
+and second requesting anchors, respectively, counting from the left.  Thus
+A2 is inside the segment that A1 is requesting or holding the locks of.
+Note that when A2 sends its request, it cannot have yet received the
+request from A1.
+Case 1: When A1's request arrives at A2, A2 is already holding the lock.
+        In this case A1's request will be refused.
+Case 2: When A1's request arrives at A2, A2 is requesting.
+        In this case A1's request is kept at A2 until A2 gets a reply to
+        its request.  If the reply is favorable, A1's request is refused.
+        If the reply is unfavorable, A1's request is forwarded to the
+        right.
+This shows that it is not possible for two left anchors to lock overlapping
+segments.
+
+It is also important to show that contention cannot cause an acceptable
+request to be refused.  This would happen if both the requests of A1 and A2
+are refused (assuming one of them has a right anchor present).  But if A2
+is refused then A1's kept request will be sent, so A1 still has a chance
+for success.
+
+2.3. Other protocol cases
+
+If requestLock, ackLock, or nackLock messages are lost, then requestLock
+is retransmitted.  See 3.2 for details.
+
+If a left anchor receives nackLock, then its attempt to lock has failed.
+The Dysco agent can retry if it is appropriate.  This decision seems very
+dependent on the particular service chain and reason for reconfiguration,
+so we are not making any general rules about it yet.
+
+It is possible that the anchors, after locking, will fail to setup a new
+path for the session to follow.  If this happens, reconfiguration must be
+canceled.  The left anchor sends cancelLock on the old path, and the right
+anchor replies with ackCancel.  If either message is lost, then cancelLock
+is retransmitted.  As the Dysco agent at the left end of a subsession
+receives the cancelLock and propagates it, it sets its lockPending and
+locked variables to false.
+
+Deltas are explained in Section 1.2.  The secondary purpose of the locking
+protocol is to accumulate the deltas, in both directions, of the 
+middleboxes in the locked segment.  These are accumulated in a field in the
+requestLock and ackLock messages.  They are then absorbed into the deltas
+that the anchors use on the new path.
+
+Consider the cases when a right endpoint is mobile, or a middlebox wishes
+to delete itself from the service chain.  These cases are a problem because
+these boxes are not the left anchors of the desired reconfiguration.
+Rather, the left anchor of the reconfiguration is the box's left neighbor.
+
+To handle these cases, we allow these boxes to send a rightRequest message
+leftward to their left neighbor.  The left neighbor can ignore the message,
+but if it chooses to respond, it initiates the reconfiguration desired by
+its right neighbor.
+
+3. THE ANCHORING STATE
+
+3.1. Substates
+
+In the anchoring state, the two anchors must complete the locking protocol
+to lock the segment (now referred to as the "old path") and set up the new
+path.  If the segment cannot be locked or the new path cannot be set up,
+then the reconfiguration must be canceled and both anchors must return to
+the normal OnePath state.  If the anchoring state is successful, then both
+anchors progress to the TwoPaths state, in which they are managing both old
+and new paths.
+
+The Anchoring state has substates Requesting, Requested, SettingUp,
+Waiting, and Canceling.  In the successful case, substates of the anchoring
+state work like this:
+   LEFT ANCHOR             RIGHT ANCHOR
+   send requestLock
+   in Requesting           receive requestLock
+                           send ackLock
+   receive ackLock         in Requested
+   send syn
+   in SettingUp            receive syn
+                           send synAck
+   receive synAck          in Waiting
+   send ack
+   in TwoPaths             receive ack
+                           in TwoPaths
+
+In most cases the different substates receive different control messages,
+so they need not be distinguished in the Anchoring state.  The only 
+exception is that the port must know whether it is in Requesting or not.
+
+This protocol makes an important assumption:
+At the time that a segment is locked for reconfiguration, all the
+middleboxes in it (which are going to be removed) have reached a state in
+which their deltas are fixed.  In other words, even if they handle
+additional data after this point, the deltas will not change.
+
+Without this assumption, a final delta for a direction of sending is not
+known until all data in the direction has been received and acknowledged,
+no matter how long it takes.  Furthermore, a middlebox cannot forward a fin
+(with a different sequence number, of course) until it has received all
+data up to the number of the incoming fin.  Until it has received and
+processed all the incoming data, it does not know how much outgoing data
+it will produce.  So without this assumption, there could be a long pause
+during which an anchor cannot send on either old or new path.
+
+With this assumption, there is no pause.  Anchors can continue sending data
+during all reconfiguration phases.
+
+3.2. Loss of UDP Messages
+
+This version is concerned with the loss of all UDP messages exchanged by
+anchors: requestLock, ackLock, nackLock, syn, synAck, ackSyn, cancelLock,
+ackCancel.  These messages come in the following request/response pairs:
+   requestLock; ackLock/nackLock (Requesting)
+   cancelLock; ackCancel (Canceling)
+   syn; synAck (SettingUp)
+   synAck; ackSyn (Waiting)
+For each pair, there are the following issues:
+ * It must be the case that the requestor is waiting specifically for the
+   response.  This is true, and the requestor is in the () state above.
+ * If a message is lost, then a message modeling a timeout must reach the
+   requestor.  (Note that middlebox failure is modeled as loss of a UDP
+   syn.)
+    - Loss of requestLock, ackLock, or nackLock is modeled as lockTimeout.
+    - Loss of syn or synAck is modeled as synTimeout.
+   Other losses are not included in the model.
+ * On each timeout, the requestor can either retransmit or abort.  This
+   allows the requestor the freedom to retransmit one or more times, then
+   abort if necessary.  Loss during Requesting is treated by
+   retransmission.  Loss during SettingUp or Waiting is treated by
+   aborting.  The details of both are below.
+
+Details of LockTimeout:
+   All locking messages go through the old path.  Loss stimulates
+retransmission.  So all components of the old path must be able to
+recognize a retransmitted message and treat it appropriately.
+
+Details of UDP SynTimeout:
+   The UDP syn handshake goes through the new path.  If it does not succeed
+on the first try then reconfiguration is aborted, because there may be a
+failure of a middlebox in the new path.  It is assumed that if the
+syn/synack pair succeeds, then the final ack will reach the left anchor.
+   To abort the reconfiguration, the left anchor will send a cancelLock on
+the old path, so the right anchor will get reset.
+   If some middleboxes on the new path were reached by the syn, they will
+not see the completed three-way handshake, and will have to time out the
+session.
+
+4. THE TWOPATHS STATE
+
+In the TwoPaths state each anchor is managing both the old and new paths.
+This requires a number of variables to keep the state of both.
+
+For addresses, newNearLoc and newFarLoc keep the addresses of the new
+path, just as nearLoc and farLoc keep the addresses of the old path.
+Usually nearLoc and newNearLoc are the same, but they are different if the
+purpose of reconfiguration is this subsession endpoint's mobility.
+
+For sequence numbers, the new path needs newFarLoc, newDelta, and
+firstNewRcvd.  For the old path there is a set of state variables oldSent,
+oldSentAcked, oldRcvd, oldRcvdAcked.
+
+In this state the anchors use macros Receive[Old/New]Data, 
+Send[Old/New]Ack, and Receive[Old/New]Ack, depending on which path is
+being used.
+
+In the TwoPaths state, no new data is sent on the old path.  The purpose of
+the state is to clean up the old path by doing all necessary 
+retransmissions and acks for the data that was already sent on it.  When it
+is all cleaned up, the split state variables are coalesced, and the program
+goes back to the OnePath state.  The macro CheckCompletion is checking for
+termination of the old path, and completes the reconfiguration.
+
+4.1. Data Handling
+
+Note that the syns that create the new path do not carry sequence numbers.
+Inserted middleboxes (in the new path) will receive their sequence numbers
+from the first data message in each direction, if any.
+
+When an anchor moves into the TwoPaths state, it sets newDelta for the new
+path.  It also copies the current values of send, sentAcked, rcvd, and
+rcvdAcked into "old-" versions of all these variables.  The "old" versions
+will be used on the old path, while the normal versions will be used on the
+new path.  Note that oldSent cannot change once it is set, because no new
+data will be sent on the old path.
+
+Sending data is simple: it is sent on the new path if its sequence number
+is >= oldSent, and on the old path otherwise.  Receiving acks of data is
+also simple, as long as the correct macro for the path is used.
+
+Receiving data is different, because the anchor does not know immediately
+where the cutoff is between old and new paths.  To help determine this,
+the anchor maintains a variable firstNewRcvd, which holds the lowest 
+sequence number it has received on the new path.  When an anchor has to
+send an ack, it must already have received the data it is acking.  So it
+can reliably used oldRcvd as the cutoff to decide whether to send the ack
+on the old or new path.
+
+Sometimes a message forwarded to an anchor must be split by the anchor, in
+the case that its data part and ack part belong on different paths.
+
+4.2. Checking Completion
+
+Anchors call the macro CheckCompletion to see if the old path is cleaned 
+up.  On the sending side, this is true if oldSentAcked = oldSent.
+
+On the receiving side, the normal case is that the new path is being used
+to receive data.  For the old path to be cleaned up, it must be true that
+oldRcvdAcked = oldRcvd.  However, there is the additional concern that
+there might still be data traveling to this anchor on the old path.  To
+make sure this is not happening, we also require that oldRcvd = 
+firstNewRcvd.  If this is true, then the sequence number of the last data
+received on the old path (plus one) is the sequence number of the first 
+data received on the new path, so we know for sure that all data has been
+received on the old path.
+
+It can also happen that the new path is never used to receive data because
+receiving has terminated.  There is a special check for this case.
+
+4.3. Termination in Middleboxes
+
+If the fin and its ack for one direction of data traverse the old path, 
+then the middleboxes of the new path will never see them.  If they traverse
+the new path, then the middleboxes of the old path will never see them.  In
+this case the middlebox will have to time out the session, just as it would
+if an endpoint failed and never sent a fin.
+
+This has an effect on the model used for verification.  The default state
+for an endpoint is OnePath, while the default state for a middlebox is
+endOnePath.  Transitions in the two are identical, except for those cases
+in which endpoints differ from middleboxes.  They are two different states
+because endOnePath is a valid end state, while OnePath is not.  So an
+endpoint must terminate correctly in both directions, while a middlebox
+need not.
+
+5. APPENDIX
+
+5.1. Independent Fins in Each Direction
+
+Although this is not widely known, the two ends of a TCP session can stop
+sending independently.  For instance, one end can send a request, send a
+fin to indicate that it will send nothing more, and then receive the
+results of the request through the session for a long time.
+
+To accommodate this, each port of an established supersession has four
+Boolean state variables:
+   "sending" is true when the port can still send (has not sent fin)
+   "finSent" is true when the port has sent a fin and not yet received an
+      acknowledgment to it
+   "receiving" is true when the port can still receive (has not received
+      fin)
+   "finRcvd" is true when the port has received a fin and not yet sent an
+      acknowledgment to it
+When a port's role in a supersession is completely finished, all four state
+variables are false.
+
+In the TCP state transition diagram, the following named states correspond
+to the following sets of true state variables:
+ESTABLISHED: sending, receiving
+CLOSE_WAIT: sending
+LAST_ACK: finSent
+FIN_WAIT_1: finSent, receiving
+FIN_WAIT_2: receiving
+CLOSING: finSent
+TIME_WAIT:
+
+What is the purpose of finRcvd, which is never true in the normal TCP
+state diagram?  It is needed by middlebox ports.  Consider a middlebox port
+that has received a fin and forwarded it.  If it were an endpoint, it would
+have immediately replied with an ack.  Because it is a middlebox port,
+however, it cannot reply with an ack until the fin goes all the way to the
+endpoint, the endpoint replies with an ack, and the ack comes to the
+middlebox in question.  During this period when it is waiting to reply, in
+the state of the middlebox port, finRcvd is true.
+
+5.2. A Discussion of Data
+
+We have realized that acks must be split at the same cutoff as the data.
+If an entity receives acks for data it did not send, it could have a bad
+reaction, e.g. RST.
+
+Extra detail about data:
+
+RF: This is fine and might not present any problem for the formal model. I
+just want to point out that, from an implementation point of view, we need
+to worry about the order that the data are delivered at the anchors. More
+specifically, if the new path is faster than the old one, data may get out
+of order at the anchors. The anchor has to buffer data that it receives
+from the new path until the data from the old path are delivered.
+
+JR: On the concern about out of order data packets... The middlebox running
+at the right anchor, and hops further downstream, can't generally assume
+ordered delivery anyway. So, while buffering and ordered delivery might be
+a nice service for a dysco agent to offer, it is not really necessary...
+
+RF: the problem with a long sequence of out-of-order packets, caused by the
+switch to a faster path, is that the receiver sends an ack for each packet
+it receives. These acks are interpreted as duplicate acks by the sender, as
+they all have the same value (the sequence number the receiver is
+expecting). On duplicate acks, the sender reduces its congestion window and
+retransmits packets that might still be in flight, which leads to
+performance degradation. While I agree that packet reordering is common in
+the Internet, the reconfiguration can lead to special cases (switching to a
+faster path) that are much more severe than what generally happens on
+normal situations.
+
+JR: Yes, that’s true.  I just wanted to clarify that this is a performance
+optimization, not a correctness issue.  Also, delaying the packets so long
+to put them back in order might have its own performance implications,
+leading to a timeout-based loss, so it’s not really obvious that delaying
+the packets to put them back in order is always the best solution.
